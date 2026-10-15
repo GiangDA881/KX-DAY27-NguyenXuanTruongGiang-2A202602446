@@ -22,12 +22,8 @@ from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
-from common.db import db_path
-# TODO: import the graph builder + helpers from your exercise 4 solution.
-# Suggestion: rename `exercises/exercise_4_audit.py` functions you need
-# (build_graph, handle_interrupt logic) and import them here, OR copy the
-# graph wiring inline.
-# from exercises.exercise_4_audit import build_graph
+from common.db import db_conn, db_path, replay_events
+from exercises.exercise_4_audit import build_graph
 
 
 load_dotenv()
@@ -45,17 +41,80 @@ if "final" not in st.session_state:
 
 
 # ─── Page setup ────────────────────────────────────────────────────────────
-st.set_page_config(page_title="HITL PR Review", layout="wide")
-st.title("HITL PR Review Agent")
+st.set_page_config(page_title="HITL PR Review Agent", layout="wide")
+st.title("🤖 HITL PR Review Agent")
+st.caption("LangGraph Human-in-the-Loop PR Review with SQLite Audit Trail")
 
 
-# ─── Sidebar — recent sessions ─────────────────────────────────────────────
+# ─── Sidebar — recent sessions & calibration stats ─────────────────────────
 with st.sidebar:
     st.header("Recent sessions")
-    # TODO: call `audit.replay.list_threads`-style query against audit_events
-    # and render thread_id + pr_url + worst_risk + last_event as a small table.
-    # On row click, set st.session_state.thread_id and rerun.
-    st.caption("(TODO — populate from audit_events)")
+
+    async def get_recent_sessions():
+        async with db_conn() as conn:
+            async with conn.execute(
+                """
+                SELECT thread_id,
+                       pr_url,
+                       MAX(timestamp)        AS last_event,
+                       MAX(risk_level)       AS worst_risk,
+                       COUNT(*)              AS events
+                  FROM audit_events
+                 GROUP BY thread_id, pr_url
+                 ORDER BY MAX(timestamp) DESC
+                 LIMIT 15
+                """
+            ) as cur:
+                return await cur.fetchall()
+
+    async def get_calibration_stats():
+        async with db_conn() as conn:
+            async with conn.execute(
+                """
+                SELECT COUNT(DISTINCT thread_id) AS total_sessions,
+                       AVG(confidence)           AS avg_conf,
+                       COUNT(CASE WHEN decision = 'approve' THEN 1 END) AS approved_count,
+                       COUNT(CASE WHEN decision = 'reject' THEN 1 END) AS rejected_count,
+                       COUNT(CASE WHEN decision = 'auto' THEN 1 END) AS auto_count,
+                       COUNT(CASE WHEN decision = 'escalate' THEN 1 END) AS escalated_count
+                  FROM audit_events
+                 WHERE action IN ('route', 'commit', 'auto_approve')
+                """
+            ) as cur:
+                return await cur.fetchone()
+
+    try:
+        recent = asyncio.run(get_recent_sessions())
+        if recent:
+            for r in recent:
+                tid = r["thread_id"]
+                pr_num = r["pr_url"].rstrip("/").split("/")[-1]
+                risk = r["worst_risk"]
+                btn_label = f"PR #{pr_num} [{risk}] - {tid[:8]}"
+                if st.button(btn_label, key=f"session_{tid}"):
+                    st.session_state.thread_id = tid
+                    st.session_state.pr_url = r["pr_url"]
+                    st.session_state.interrupt_payload = None
+                    st.session_state.final = None
+                    st.rerun()
+        else:
+            st.caption("No previous sessions recorded yet.")
+
+        # Bonus 2: Calibration stats
+        st.divider()
+        st.subheader("📊 Calibration Analytics")
+        stats = asyncio.run(get_calibration_stats())
+        if stats and stats["total_sessions"]:
+            st.metric("Total Sessions", stats["total_sessions"])
+            avg_c = stats["avg_conf"] or 0.0
+            st.metric("Average Confidence", f"{avg_c:.1%}")
+            col_a, col_b = st.columns(2)
+            col_a.write(f"✅ Approved: {stats['approved_count']}")
+            col_b.write(f"⚡ Auto: {stats['auto_count']}")
+            col_a.write(f"❌ Rejected: {stats['rejected_count']}")
+            col_b.write(f"⚠️ Escalated: {stats['escalated_count']}")
+    except Exception:
+        st.caption("Database not initialized yet.")
 
 
 # ─── Top form — start a new review ─────────────────────────────────────────
@@ -64,7 +123,7 @@ with st.form("start"):
         "PR URL", value=st.session_state.pr_url,
         placeholder="https://github.com/VinUni-AI20k/PR-Demo/pull/1",
     )
-    submitted = st.form_submit_button("Run review")
+    submitted = st.form_submit_button("Run review", type="primary")
 
 
 # ─── Renderers per interrupt kind ──────────────────────────────────────────
@@ -72,8 +131,8 @@ def render_approval_card(payload: dict) -> dict | None:
     """58–72% bucket: show the LLM review + 3 buttons. Return resume dict or None."""
     conf = payload["confidence"]
     st.subheader(f"Approval requested — confidence {conf:.0%}")
-    st.caption(payload["confidence_reasoning"])
-    st.markdown(payload["summary"])
+    st.caption(payload.get("confidence_reasoning", ""))
+    st.markdown(payload.get("summary", ""))
 
     for c in payload.get("comments", []):
         st.markdown(f"- **[{c['severity']}]** `{c['file']}:{c.get('line') or '?'}` — {c['body']}")
@@ -81,18 +140,14 @@ def render_approval_card(payload: dict) -> dict | None:
     with st.expander("Diff"):
         st.code(payload.get("diff_preview", ""), language="diff")
 
-    feedback = st.text_input("Feedback (optional)", key="approval_feedback")
+    feedback = st.text_input("Feedback / Edit instructions (optional)", key="approval_feedback")
     col1, col2, col3 = st.columns(3)
-    # TODO: hook up the three buttons. Each click should return one of:
-    #   {"choice": "approve", "feedback": feedback}
-    #   {"choice": "reject",  "feedback": feedback}
-    #   {"choice": "edit",    "feedback": feedback}
-    if col1.button("Approve", type="primary"):
-        ...  # return {"choice": "approve", ...}
-    if col2.button("Reject"):
-        ...
-    if col3.button("Edit"):
-        ...
+    if col1.button("Approve", type="primary", use_container_width=True):
+        return {"choice": "approve", "feedback": feedback}
+    if col2.button("Reject", use_container_width=True):
+        return {"choice": "reject", "feedback": feedback}
+    if col3.button("Edit", use_container_width=True):
+        return {"choice": "edit", "feedback": feedback}
     return None
 
 
@@ -100,17 +155,17 @@ def render_escalation_card(payload: dict) -> dict | None:
     """< 58% bucket: show risk factors + question form. Return {question: answer} or None."""
     conf = payload["confidence"]
     st.subheader(f"Strong escalation — confidence {conf:.0%}")
-    st.caption(payload["confidence_reasoning"])
+    st.caption(payload.get("confidence_reasoning", ""))
     if payload.get("risk_factors"):
         st.error("Risks: " + ", ".join(payload["risk_factors"]))
-    st.markdown(payload["summary"])
+    st.markdown(payload.get("summary", ""))
 
     with st.form("escalation"):
-        # TODO: render one text_input per question in payload["questions"]
-        #       collect answers into a dict {question: answer_str}
-        #       on submit, return the dict.
         answers: dict[str, str] = {}
-        st.form_submit_button("Submit answers")
+        for i, q in enumerate(payload.get("questions", [])):
+            answers[q] = st.text_input(q, key=f"q_{i}")
+        if st.form_submit_button("Submit answers"):
+            return answers
     return None
 
 
@@ -119,18 +174,18 @@ async def run_graph(pr_url: str, thread_id: str, resume_value=None):
     """Invoke the graph once. Returns the final result or {'__interrupt__': ...}."""
     async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
         await cp.setup()
-        # TODO: build the graph with `cp` as the checkpointer (use the function
-        # you imported/copied at the top of this file).
-        # app = build_graph(cp)
+        app = build_graph(cp)
         cfg = {"configurable": {"thread_id": thread_id}}
 
-        # TODO:
-        # - If resume_value is None: result = await app.ainvoke(
-        #       {"pr_url": pr_url, "thread_id": thread_id}, cfg)
-        # - Else:                    result = await app.ainvoke(
-        #       Command(resume=resume_value), cfg)
-        # - Return result.
-        raise NotImplementedError("Wire up the graph invocation")
+        if resume_value is None:
+            result = await app.ainvoke(
+                {"pr_url": pr_url, "thread_id": thread_id}, cfg
+            )
+        else:
+            result = await app.ainvoke(
+                Command(resume=resume_value), cfg
+            )
+        return result
 
 
 # ─── Main flow ─────────────────────────────────────────────────────────────
@@ -175,5 +230,14 @@ if st.session_state.final is not None:
         st.warning("Rejected — no comment posted")
     else:
         st.info(f"final_action = {action}")
-    st.caption(f"thread_id = {st.session_state.thread_id}  ·  replay: "
+    st.caption(f"thread_id = `{st.session_state.thread_id}`  ·  Replay CLI: "
                f"`uv run python -m audit.replay --thread {st.session_state.thread_id}`")
+
+# Render Audit timeline if thread is active
+if st.session_state.thread_id:
+    with st.expander("🔍 Session Audit Trail & Replay Timeline", expanded=False):
+        async def fetch_events(tid):
+            return await replay_events(tid)
+        evs = asyncio.run(fetch_events(st.session_state.thread_id))
+        if evs:
+            st.dataframe(evs, use_container_width=True)
